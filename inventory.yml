@@ -16,7 +16,7 @@
 
 images:
   - label: "APIC ISO"
-    filename: "aci-apic-dk9.6.1.5e.iso"
+    filename: "aci-apic-dk9.6.1.6g.iso"
     reference_md5: "8bcd042f1049f596ad9c252f5a32d70a"
 
   - label: "NX-OS 64-bit"
