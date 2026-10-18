@@ -1,0 +1,28 @@
+---
+# Included once per entry in `_raw_images` (loop_var: item = {label, filename}).
+# Appends one entry to `generated_images` with the MD5 computed from the
+# local file. If the file can't be found, reference_md5 is left blank (with
+# a console warning) rather than failing the whole run.
+
+- name: "{{ item.label }}: stat the local file (md5)"
+  ansible.builtin.stat:
+    path: "{{ local_image_dir }}/{{ item.filename }}"
+    checksum_algorithm: md5
+  register: _local_stat
+
+- name: "{{ item.label }}: warn if the file wasn't found locally"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ local_image_dir }}/{{ item.filename }} not found --
+      reference_md5 will be left blank for this image (checksum check will
+      be skipped until you fix this and re-run).
+  when: not _local_stat.stat.exists
+
+- name: "{{ item.label }}: record the generated entry"
+  ansible.builtin.set_fact:
+    generated_images: "{{ (generated_images | default([])) + [_image_entry] }}"
+  vars:
+    _image_entry:
+      label: "{{ item.label }}"
+      filename: "{{ item.filename }}"
+      reference_md5: "{{ _local_stat.stat.checksum if _local_stat.stat.exists else '' }}"

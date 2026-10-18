@@ -21,12 +21,16 @@
     _stem_match_regex: "^{{ _expected_stem | regex_escape }}\\.[^.]+$"
 
 - name: "{{ item.label }}: look for a matching repository entry (by stem)"
+  # Not every firmwareFirmware entry on a real APIC has all three of
+  # isoname/origFileName/name populated -- the 'defined' test drops entries
+  # missing a given attribute before 'match' is tested against it, so a
+  # missing attribute is treated as "no match" instead of a hard error.
   ansible.builtin.set_fact:
     _matched_image: >-
       {{
-        (repo_images | selectattr('isoname', 'match', _stem_match_regex) | list
-         + repo_images | selectattr('origFileName', 'match', _stem_match_regex) | list
-         + repo_images | selectattr('name', 'match', _stem_match_regex) | list)
+        (repo_images | selectattr('isoname', 'defined') | selectattr('isoname', 'match', _stem_match_regex) | list
+         + repo_images | selectattr('origFileName', 'defined') | selectattr('origFileName', 'match', _stem_match_regex) | list
+         + repo_images | selectattr('name', 'defined') | selectattr('name', 'match', _stem_match_regex) | list)
         | first | default({})
       }}
 
