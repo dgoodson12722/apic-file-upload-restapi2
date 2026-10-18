@@ -1,0 +1,86 @@
+---
+# Included once per entry in `images` (loop variable: item = {filename, reference_md5}).
+# Appends one entry to the host-level `image_results` list with a status of
+# PASS or FAIL, so the parent playbook can summarize everything at the end
+# even if one image fails -- the loop keeps going to the next image.
+
+- name: "{{ item.filename }}: initialize result for this image"
+  ansible.builtin.set_fact:
+    _result:
+      filename: "{{ item.filename }}"
+      local_path: "{{ local_image_dir }}/{{ item.filename }}"
+      remote_path: "{{ remote_image_dest | regex_replace('/$', '') }}/{{ item.filename }}"
+      status: "UNKNOWN"
+
+- block:
+
+    - name: "{{ item.filename }}: stat local file (md5)"
+      ansible.builtin.stat:
+        path: "{{ local_image_dir }}/{{ item.filename }}"
+        checksum_algorithm: md5
+      delegate_to: localhost
+      become: false
+      register: _local_stat
+
+    - name: "{{ item.filename }}: fail if local file is missing"
+      ansible.builtin.fail:
+        msg: "Local file not found: {{ local_image_dir }}/{{ item.filename }}"
+      when: not _local_stat.stat.exists
+
+    - name: "{{ item.filename }}: record local md5"
+      ansible.builtin.set_fact:
+        _result: "{{ _result | combine({'local_md5': _local_stat.stat.checksum}) }}"
+
+    - name: "{{ item.filename }}: check local file against reference md5"
+      ansible.builtin.fail:
+        msg: >-
+          Reference MD5 mismatch for {{ item.filename }}: expected
+          {{ item.reference_md5 }}, got {{ _local_stat.stat.checksum }}.
+          This file was NOT copied -- re-download and re-verify before retrying.
+      when:
+        - item.reference_md5 is defined
+        - item.reference_md5 | length > 0
+        - item.reference_md5 | lower != _local_stat.stat.checksum | lower
+
+    - name: "{{ item.filename }}: copy image to APIC"
+      ansible.builtin.copy:
+        src: "{{ local_image_dir }}/{{ item.filename }}"
+        dest: "{{ remote_image_dest }}"
+        mode: "0644"
+      register: _copy_result
+
+    - name: "{{ item.filename }}: stat remote file (md5) after copy"
+      ansible.builtin.stat:
+        path: "{{ _result.remote_path }}"
+        checksum_algorithm: md5
+      register: _remote_stat
+
+    - name: "{{ item.filename }}: fail if remote file missing after copy"
+      ansible.builtin.fail:
+        msg: "File not found on APIC after copy: {{ _result.remote_path }}"
+      when: not _remote_stat.stat.exists
+
+    - name: "{{ item.filename }}: record remote md5"
+      ansible.builtin.set_fact:
+        _result: "{{ _result | combine({'remote_md5': _remote_stat.stat.checksum}) }}"
+
+    - name: "{{ item.filename }}: fail if local/remote md5 mismatch"
+      ansible.builtin.fail:
+        msg: >-
+          MD5 mismatch after copy for {{ item.filename }}: local
+          {{ _local_stat.stat.checksum }} vs remote {{ _remote_stat.stat.checksum }}
+      when: _local_stat.stat.checksum | lower != _remote_stat.stat.checksum | lower
+
+    - name: "{{ item.filename }}: mark PASS"
+      ansible.builtin.set_fact:
+        _result: "{{ _result | combine({'status': 'PASS'}) }}"
+
+  rescue:
+
+    - name: "{{ item.filename }}: mark FAIL and record the error"
+      ansible.builtin.set_fact:
+        _result: "{{ _result | combine({'status': 'FAIL', 'error': ansible_failed_result.msg | default('unknown error')}) }}"
+
+- name: "{{ item.filename }}: append to run results"
+  ansible.builtin.set_fact:
+    image_results: "{{ (image_results | default([])) + [_result] }}"

@@ -1,0 +1,209 @@
+---
+# "Pre-flight" health check for ACI upgrades -- REST API version (no SSH).
+#
+# Confirms cluster health, free space on /firmware, and whether the three
+# expected upgrade images are already present in the APIC's firmware
+# repository -- by calling the APIC's REST API directly (the same calls the
+# APIC GUI itself makes, captured via Show Debug Info / API Inspector and
+# confirmed against a live fabric).
+#
+# Report-only: this script does not copy, upload, or change anything on the
+# APIC. It's meant to run before Script 1 (01_copy_and_verify_images.yml) to
+# confirm the fabric is in a good state before moving any images.
+#
+# Image filenames and reference MD5 hashes come from ../inventory.yml, not
+# runtime prompts -- edit that file once instead of retyping them each run.
+#
+# Usage:
+#   ansible-playbook playbooks/00_check_apic_health.yml
+#
+# Requirements: ansible-core 2.20.1 / Python 3.14 compatible.
+# (Tested in this form against ansible-core 2.20.1 on Python 3.13, the
+# closest available to 3.14; nothing in this playbook is Python-version
+# sensitive -- it's plain YAML/Jinja2 -- so the result applies to 3.14 too.)
+
+- name: Check APIC cluster health, firmware free space, and images present
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../inventory.yml
+  vars_prompt:
+    - name: apic_host
+      prompt: "APIC IP address or hostname"
+      private: false
+
+    - name: apic_user
+      prompt: "APIC username"
+      private: false
+
+    - name: apic_password
+      prompt: "APIC password"
+      private: true
+
+    - name: validate_certs
+      prompt: >-
+        Validate the APIC's TLS certificate? (yes/no -- APICs commonly use a
+        self-signed cert, so 'no' is typical)
+      private: false
+      default: "no"
+
+    - name: free_space_warn_pct
+      prompt: "Warn if /firmware utilization on any APIC is at or above this percent"
+      private: false
+      default: "80"
+
+  tasks:
+    - name: Cast prompted values to the right types
+      ansible.builtin.set_fact:
+        validate_certs_bool: "{{ validate_certs | bool }}"
+        free_space_warn_pct_int: "{{ free_space_warn_pct | int }}"
+        log_dir: "{{ playbook_dir }}/../logs"
+
+    - name: Log in to the APIC (aaaLogin)
+      ansible.builtin.uri:
+        url: "https://{{ apic_host }}/api/aaaLogin.json"
+        method: POST
+        body_format: json
+        body:
+          aaaUser:
+            attributes:
+              name: "{{ apic_user }}"
+              pwd: "{{ apic_password }}"
+        validate_certs: "{{ validate_certs_bool }}"
+        status_code: 200
+      register: _apic_login
+      no_log: true
+
+    - name: Capture the session token as a cookie header for later calls
+      ansible.builtin.set_fact:
+        apic_cookie_header: "APIC-cookie={{ _apic_login.json.imdata[0].aaaLogin.attributes.token }}"
+      no_log: true
+
+    - name: Query cluster health (infraWiNode)
+      ansible.builtin.uri:
+        url: >-
+          https://{{ apic_host }}/api/node/class/infraWiNode.json?query-target-filter=not(wcard(infraWiNode.dn,%22__ui_%22))&query-target-filter=wcard(infraWiNode.dn,%22topology/pod-1/node-1/av%22)
+        method: GET
+        headers:
+          Cookie: "{{ apic_cookie_header }}"
+        validate_certs: "{{ validate_certs_bool }}"
+        status_code: 200
+      register: _cluster_raw
+
+    - name: Query /firmware free space (eqptStorage)
+      ansible.builtin.uri:
+        url: >-
+          https://{{ apic_host }}/api/node/class/eqptStorage.json?query-target-filter=eq(eqptStorage.mount,%22/firmware%22)
+        method: GET
+        headers:
+          Cookie: "{{ apic_cookie_header }}"
+        validate_certs: "{{ validate_certs_bool }}"
+        status_code: 200
+      register: _storage_raw
+
+    - name: Query firmware repository images (firmwareFirmware)
+      ansible.builtin.uri:
+        url: "https://{{ apic_host }}/api/node/class/firmwareFirmware.json"
+        method: GET
+        headers:
+          Cookie: "{{ apic_cookie_header }}"
+        validate_certs: "{{ validate_certs_bool }}"
+        status_code: 200
+      register: _images_raw
+
+    - name: Extract cluster health per controller
+      ansible.builtin.set_fact:
+        cluster_nodes: "{{ _cluster_raw.json.imdata | map(attribute='infraWiNode.attributes') | list }}"
+
+    - name: Extract free space per controller
+      ansible.builtin.set_fact:
+        storage_nodes: "{{ _storage_raw.json.imdata | map(attribute='eqptStorage.attributes') | list }}"
+
+    - name: Extract firmware repository images
+      ansible.builtin.set_fact:
+        repo_images: "{{ _images_raw.json.imdata | map(attribute='firmwareFirmware.attributes') | list }}"
+
+    - name: Determine overall cluster health
+      ansible.builtin.set_fact:
+        cluster_healthy: >-
+          {{ (cluster_nodes | selectattr('health', 'equalto', 'fully-fit') | list | length) == (cluster_nodes | length)
+             and (cluster_nodes | length > 0) }}
+
+    - name: Flag any controller over the free-space warning threshold
+      ansible.builtin.set_fact:
+        storage_pcts: "{{ storage_nodes | map(attribute='capUtilized') | map('int') | list }}"
+
+    - name: Compute whether any controller is over threshold
+      ansible.builtin.set_fact:
+        storage_over_threshold: "{{ storage_pcts | select('ge', free_space_warn_pct_int) | list | length > 0 }}"
+
+    - name: Check each expected image against the firmware repository
+      ansible.builtin.include_tasks: ../tasks/check_one_image.yml
+      loop: "{{ images }}"
+      loop_control:
+        label: "{{ item.label }}"
+        loop_var: item
+
+    - name: Print cluster health to the console
+      ansible.builtin.debug:
+        msg: "{{ item.nodeName | default(item.dn) }}: health={{ item.health }}"
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        label: "{{ item.nodeName | default(item.dn) }}"
+
+    - name: Print free space to the console
+      ansible.builtin.debug:
+        msg: "{{ item.dn }}: /firmware capUtilized={{ item.capUtilized }}%"
+      loop: "{{ storage_nodes }}"
+      loop_control:
+        label: "{{ item.dn }}"
+
+    - name: Print image check results to the console
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.label }} ({{ item.filename }}): {{ item.status }}
+          {{ ('-- stored as ' + item.matched_name + ', downloaded=' + item.dnldStatus + ', sync=' + item.syncCompleteStatus)
+             if item.status in ['PRESENT', 'CHECKSUM MISMATCH'] else '' }}
+          {{ ('-- expected md5 ' + item.reference_md5 + ', repo checksum ' + item.checksum) if item.status == 'CHECKSUM MISMATCH' else '' }}
+      loop: "{{ image_check_results }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Ensure the log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Capture a run timestamp
+      ansible.builtin.set_fact:
+        run_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Build the full summary object
+      ansible.builtin.set_fact:
+        health_summary:
+          apic_host: "{{ apic_host }}"
+          run_timestamp: "{{ run_timestamp }}"
+          cluster_health:
+            overall_healthy: "{{ cluster_healthy }}"
+            nodes: "{{ cluster_nodes }}"
+          free_space:
+            warn_threshold_pct: "{{ free_space_warn_pct_int }}"
+            over_threshold: "{{ storage_over_threshold }}"
+            nodes: "{{ storage_nodes }}"
+          images: "{{ image_check_results }}"
+
+    - name: Write JSON summary for this run
+      ansible.builtin.copy:
+        content: "{{ health_summary | to_nice_json }}\n"
+        dest: "{{ log_dir }}/apic_health_check_{{ apic_host }}_{{ run_timestamp }}.json"
+        mode: "0644"
+
+    - name: Fail the play if cluster health or free space is a problem
+      ansible.builtin.fail:
+        msg: >-
+          APIC health check found problems for {{ apic_host }}:
+          {{ 'cluster not fully-fit; ' if not cluster_healthy else '' }}
+          {{ ('/firmware utilization at or above ' + (free_space_warn_pct_int | string) + '% on at least one controller; ') if storage_over_threshold else '' }}
+          See the JSON summary for details.
+      when: not cluster_healthy or storage_over_threshold

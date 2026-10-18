@@ -1,0 +1,115 @@
+---
+# Script 1 of the ACI upgrade toolkit -- fully interactive version.
+#
+# No static inventory of hosts needed -- the APIC is registered as a
+# dynamic in-memory host below. Image filenames and reference MD5 hashes
+# come from ../inventory.yml, not runtime prompts -- edit that file once
+# instead of retyping them each run. Everything else (APIC IP, SSH
+# username/password, local image directory, destination path) is still
+# asked for at runtime.
+#
+# Usage:
+#   ansible-playbook playbooks/01_copy_and_verify_images.yml
+#
+# Requirements: ansible-core 2.20.1 / Python 3.14 compatible.
+# (Tested in this form against ansible-core 2.20.1 on Python 3.13, the
+# closest available to 3.14; nothing in this playbook is Python-version
+# sensitive -- it's plain YAML/Jinja2 -- so the result applies to 3.14 too.)
+
+- name: Gather connection details interactively
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../inventory.yml
+  vars_prompt:
+    - name: apic_host
+      prompt: "APIC IP address or hostname"
+      private: false
+
+    - name: apic_user
+      prompt: "SSH username"
+      private: false
+
+    - name: apic_password
+      prompt: "SSH password (leave blank to use SSH key/agent auth instead)"
+      private: true
+      default: ""
+
+    - name: local_image_dir
+      prompt: "Local directory on this jump host containing the images"
+      private: false
+
+    - name: remote_image_dest
+      prompt: "Destination directory on the APIC"
+      private: false
+      default: "/firmware/fwrepos/fwrepo/"
+
+  tasks:
+    - name: Register the APIC as a dynamic in-memory host for this run
+      ansible.builtin.add_host:
+        name: target_apic
+        ansible_host: "{{ apic_host }}"
+        ansible_user: "{{ apic_user }}"
+        # Blank password -> omit the var entirely so Ansible falls back to
+        # SSH key/agent auth instead of attempting password auth.
+        ansible_password: "{{ apic_password if (apic_password | length > 0) else omit }}"
+        # Ad hoc connection to whatever IP you typed above -- first-time
+        # connections won't have a known_hosts entry yet. This skips that
+        # check so the run doesn't hang waiting for a prompt that won't
+        # come (vars_prompt already consumed stdin). If you'd rather manage
+        # known_hosts yourself, delete the line below.
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        apic_host: "{{ apic_host }}"
+        local_image_dir: "{{ local_image_dir }}"
+        remote_image_dest: "{{ remote_image_dest }}"
+        log_dir: "{{ playbook_dir }}/../logs"
+        images: "{{ images }}"
+
+- name: Copy and verify APIC/NX-OS images
+  hosts: target_apic
+  gather_facts: false
+
+  tasks:
+    - name: Initialize results list for this host
+      ansible.builtin.set_fact:
+        image_results: []
+
+    - name: Process each image (reference check, copy, verify)
+      ansible.builtin.include_tasks: ../tasks/copy_and_verify_one_image.yml
+      loop: "{{ images }}"
+      loop_control:
+        label: "{{ item.filename }}"
+
+    - name: Print summary to the console
+      ansible.builtin.debug:
+        msg: "{{ item.filename }}: {{ item.status }}{{ (' -- ' + item.error) if item.error is defined else '' }}"
+      loop: "{{ image_results }}"
+      loop_control:
+        label: "{{ item.filename }}"
+
+    - name: Ensure the log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Capture a run timestamp
+      ansible.builtin.set_fact:
+        run_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Write JSON summary for this host
+      ansible.builtin.copy:
+        content: "{{ image_results | to_nice_json }}\n"
+        dest: "{{ log_dir }}/image_copy_verify_{{ apic_host }}_{{ run_timestamp }}.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Fail the play if any image failed copy/verification
+      ansible.builtin.fail:
+        msg: >-
+          One or more images failed for {{ apic_host }}:
+          {{ image_results | selectattr('status', 'equalto', 'FAIL') | map(attribute='filename') | list }}
+      when: image_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0

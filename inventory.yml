@@ -1,0 +1,28 @@
+---
+# Pre-configured image inventory for the ACI upgrade toolkit.
+#
+# Edit this file instead of retyping filenames/hashes at every run. Used by
+# both:
+#   playbooks/00_check_apic_health.yml      (images-present + checksum check)
+#   playbooks/01_copy_and_verify_images.yml (copy + verify)
+#
+# filename:      the image's filename as you have it locally (and as it was
+#                originally named by Cisco). Matching against the APIC's
+#                firmware repository is done by filename STEM (ignoring the
+#                extension), since the repository doesn't always list an
+#                image under the same extension you have locally.
+# reference_md5: the known-good MD5 of the file as downloaded from Cisco.
+#                Leave as "" to skip the checksum check for that image.
+
+images:
+  - label: "APIC ISO"
+    filename: "aci-apic-dk9.6.1.5e.iso"
+    reference_md5: "8bcd042f1049f596ad9c252f5a32d70a"
+
+  - label: "NX-OS 64-bit"
+    filename: "aci-n9000-dk9.16.1.6g-cs_64.bin"
+    reference_md5: "216a145623712179fcdd292b66059ccf"
+
+  - label: "NX-OS 32-bit"
+    filename: "aci-n9000-dk9.16.1.6g.bin"
+    reference_md5: "cf89437a26f9837d455f5ae573357f31"

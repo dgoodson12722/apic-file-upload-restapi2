@@ -1,0 +1,57 @@
+---
+# Included once per entry in `images` (loop_var: item = {label, filename, reference_md5}).
+# Appends one entry to `image_check_results` describing whether this image is
+# already present in the APIC's firmware repository (class firmwareFirmware).
+#
+# Matching is done by filename STEM (ignoring the extension), because the
+# APIC's firmware repository doesn't always list a given image under the
+# same extension you have locally (e.g. an uploaded .iso can be listed
+# under a .bin name internally) -- confirmed against a live APIC. When a
+# reference MD5 is supplied (via inventory.yml), it's compared against the
+# matched entry's `checksum` attribute, so a same-stem match that's
+# actually a different file is caught as a mismatch rather than a false
+# PRESENT.
+
+- name: "{{ item.label }}: compute the expected filename stem"
+  ansible.builtin.set_fact:
+    _expected_stem: "{{ item.filename | regex_replace('\\.[^.]+$', '') }}"
+
+- name: "{{ item.label }}: build a same-stem match regex"
+  ansible.builtin.set_fact:
+    _stem_match_regex: "^{{ _expected_stem | regex_escape }}\\.[^.]+$"
+
+- name: "{{ item.label }}: look for a matching repository entry (by stem)"
+  ansible.builtin.set_fact:
+    _matched_image: >-
+      {{
+        (repo_images | selectattr('isoname', 'match', _stem_match_regex) | list
+         + repo_images | selectattr('origFileName', 'match', _stem_match_regex) | list
+         + repo_images | selectattr('name', 'match', _stem_match_regex) | list)
+        | first | default({})
+      }}
+
+- name: "{{ item.label }}: determine status (present / checksum mismatch / not found)"
+  ansible.builtin.set_fact:
+    _image_status: >-
+      {{
+        'NOT FOUND' if (_matched_image | length == 0)
+        else ('CHECKSUM MISMATCH' if (item.reference_md5 is defined and item.reference_md5 | length > 0
+              and item.reference_md5 | lower != (_matched_image.checksum | default('') | lower))
+              else 'PRESENT')
+      }}
+
+- name: "{{ item.label }}: record the result"
+  ansible.builtin.set_fact:
+    image_check_results: "{{ (image_check_results | default([])) + [_image_result] }}"
+  vars:
+    _image_result:
+      label: "{{ item.label }}"
+      filename: "{{ item.filename }}"
+      status: "{{ _image_status }}"
+      matched_name: "{{ _matched_image.name | default('') }}"
+      dnldStatus: "{{ _matched_image.dnldStatus | default('') }}"
+      syncCompleteStatus: "{{ _matched_image.syncCompleteStatus | default('') }}"
+      version: "{{ _matched_image.version | default('') }}"
+      size: "{{ _matched_image.size | default('') }}"
+      checksum: "{{ _matched_image.checksum | default('') }}"
+      reference_md5: "{{ item.reference_md5 | default('') }}"
